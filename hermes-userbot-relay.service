@@ -1,0 +1,15 @@
+[Unit]
+Description=Hermes Userbot Relay — bot-to-bot message relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/hermes-userbot-relay
+ExecStart=%h/hermes-userbot-relay/venv/bin/python relay.py
+Restart=on-failure
+RestartSec=5
+EnvironmentFile=%h/hermes-userbot-relay/.env
+
+[Install]
+WantedBy=default.target
