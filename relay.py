@@ -98,8 +98,16 @@ async def on_bot_message(client: Client, message: Message):
         return
 
     # skip reasoning-only messages (no content after stripping reasoning)
-    # Reasoning block: starts with 💭 Reasoning:, ends at empty line or before @mention on new line
-    cleaned = re.sub(r'💭\s*Reasoning:[\s\S]*?(?=\n\s*\n|\n@|\Z)', '', text).strip()
+    # Reasoning block: starts with 💭 Reasoning:, consume GREEDILY until
+    # the LAST blank line (or end of text), so internal \n\n in reasoning
+    # doesn't cause premature cutoff.
+    text = re.sub(
+        r'💭\s*Reasoning:\s*\n[\s\S]*\n\s*\n(?=[^\n])',
+        '', text
+    ).strip()
+    # If no trailing blank line, reasoning goes to end — strip it entirely
+    text = re.sub(r'💭\s*Reasoning:\s*\n[\s\S]*', '', text).strip()
+    cleaned = text
     # also clean up leading empty lines
     cleaned = re.sub(r'^\s+', '', cleaned)
     if not cleaned:
