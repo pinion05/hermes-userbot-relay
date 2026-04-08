@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Hermes Userbot Relay
+Hermes Userbot Relay (Telethon)
 Telegram bot-to-bot message relay for group chats.
 
 Listens for bot messages that @mention other bots,
@@ -9,15 +9,15 @@ so the target bot can actually receive it.
 
 Relay format:
     @irispinion_bot
-    to hermes
+    to irispinion_bot
+    from hermes
     <original body>
 
+    @​hermesspinion_bot 로 멘션하여 답장할 수 있습니다.
+
 Stability features:
-    - on_disconnect handler: explicit reconnection on transport disconnect
-    - Watchdog: detects "zombie connections" where TCP is alive but
-      no updates arrive, and forces a reconnect
-    - Proper exception handling with crash-on-unrecoverable
-    - Reduced logging noise in production
+    - Watchdog: detects stale event loops and reconnects
+    - Graceful shutdown on SIGTERM/SIGINT
 """
 
 import asyncio
@@ -28,12 +28,15 @@ import logging
 import time
 from pathlib import Path
 from dotenv import load_dotenv
-from pyrogram import Client, filters, idle
-from pyrogram.types import Message
+from telethon import TelegramClient, events
+from telethon.tl.types import Channel, Chat, User
 
 RELAY_DIR = Path(__file__).parent
 
 load_dotenv(RELAY_DIR / ".env")
+
+API_ID = int(os.environ.get("TELEGRAM_API_ID", "0"))
+API_HASH = os.environ.get("TELEGRAM_API_HASH", "")
 
 # Known bot usernames that should trigger relay
 KNOWN_BOT_USERNAMES = {
@@ -44,27 +47,24 @@ KNOWN_BOT_USERNAMES = {
 MENTION_RE = re.compile(r'@(\w+)')
 RELAY_FORMAT_RE = re.compile(r'^@\w+\nto \w+', re.MULTILINE)
 
-# Watchdog: if no updates of any kind arrive in this many seconds,
-# force a reconnect. Telegram's server can silently stop sending
-# updates while keeping the TCP connection alive ("zombie connection").
+# Watchdog: if no events arrive in this many seconds, reconnect
 WATCHDOG_TIMEOUT = 300  # 5 minutes
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     level=logging.INFO,
 )
-# Suppress noisy pyrogram internals
-logging.getLogger("pyrogram.session.session").setLevel(logging.WARNING)
-logging.getLogger("pyrogram.connection.connection").setLevel(logging.WARNING)
-
 log = logging.getLogger("relay")
 
 
-def get_sender_name(message: Message) -> str:
+def get_sender_name(event) -> str:
     """Get the sender's telegram username or first name."""
-    if not message.from_user:
+    sender = event.sender
+    if not sender:
         return "unknown"
-    return message.from_user.username or message.from_user.first_name or "unknown"
+    if isinstance(sender, User):
+        return sender.username or sender.first_name or "unknown"
+    return getattr(sender, 'title', 'unknown')
 
 
 def extract_target_and_body(text: str, entities=None):
@@ -76,123 +76,104 @@ def extract_target_and_body(text: str, entities=None):
             body = MENTION_RE.sub('', text).strip()
             return mention, body
 
-    # Fallback: check entities for mention type (MessageEntityType.MENTION)
+    # Fallback: check entities for MessageEntityMention
     if entities:
         for entity in entities:
-            entity_type = getattr(entity, 'type', None)
-            if entity_type is None:
-                continue
-            type_name = entity_type.value if hasattr(entity_type, 'value') else str(entity_type)
-            if type_name in ('mention', 'text_mention'):
+            if hasattr(entity, 'offset') and hasattr(entity, 'length'):
                 try:
                     entity_text = text[entity.offset:entity.offset + entity.length]
-                except (AttributeError, IndexError):
+                except (IndexError, TypeError):
                     continue
                 if entity_text.startswith('@'):
                     username = entity_text[1:]
-                else:
-                    username = entity_text
-                if username in KNOWN_BOT_USERNAMES:
-                    body = text.strip()
-                    return username, body
+                    if username in KNOWN_BOT_USERNAMES:
+                        body = text.strip()
+                        return username, body
 
     return None, None
 
 
-app = Client(
-    str(RELAY_DIR / "hermes_relay"),
-    api_id=int(os.environ.get("TELEGRAM_API_ID", "0")),
-    api_hash=os.environ.get("TELEGRAM_API_HASH", ""),
-)
-
-# Watchdog state
-_last_update_time = time.monotonic()
-_watchdog_task = None
-
-
-async def watchdog_loop():
-    """
-    Periodically check if we're receiving updates.
-    If no updates arrive for WATCHDOG_TIMEOUT seconds, the connection
-    is likely a "zombie" — TCP alive but update stream dead.
-    Force a reconnect by stopping and restarting the client session.
-    """
-    global _last_update_time
-    while True:
-        await asyncio.sleep(60)  # Check every minute
-        now = time.monotonic()
-        stale_seconds = now - _last_update_time
-        if stale_seconds > WATCHDOG_TIMEOUT:
-            log.warning(
-                "Watchdog: no updates for %d seconds (threshold: %d). "
-                "Forcing reconnect to clear zombie connection.",
-                stale_seconds, WATCHDOG_TIMEOUT,
-            )
-            try:
-                # Restart the MTProto session at the transport level.
-                # We do NOT use app.restart() because it calls terminate() which
-                # clears the dispatcher groups, losing all decorator-registered
-                # handlers (on_message, on_raw_update, on_disconnect).
-                # Instead, restart only app.session which creates a new TCP
-                # connection and recv_worker while keeping the dispatcher intact.
-                await app.session.stop()
-                await app.session.start()
-                # After session restart, re-sync update state with Telegram
-                # so we get the missed updates
-                from pyrogram import raw
-                await app.invoke(raw.functions.updates.GetState())
-                _last_update_time = time.monotonic()
-                log.info("Watchdog: session reconnect successful, updates should resume.")
-            except Exception as e:
-                log.error("Watchdog: session reconnect failed: %s", e)
-                # Let systemd handle it via Restart=on-failure
-                raise
-
-
-@app.on_raw_update()
-async def on_raw_update(client, update, users, chats):
-    """Track any incoming update for the watchdog."""
-    global _last_update_time
-    _last_update_time = time.monotonic()
-
-
-@app.on_message(filters.group & filters.bot)
-async def on_bot_message(client: Client, message: Message):
-    text = message.text or message.caption or ""
-    sender = get_sender_name(message)
-    log.debug("Bot message from %s | text: %.200s", sender, text)
-    if not text:
-        return
-
-    # skip reasoning-only messages (no content after stripping reasoning)
-    # Normalize multiple blank lines to single blank line first,
-    # then strip reasoning block greedily up to the last blank line.
+def strip_reasoning(text: str) -> str:
+    """Remove 💭 Reasoning: blocks from text, handling internal blank lines."""
+    # Normalize multiple blank lines to single blank line
     text = re.sub(r'\n[ \t]*\n', '\n\n', text)
+    # Greedy: match reasoning block up to the last blank line before content
     text = re.sub(
         r'💭\s*Reasoning:\s*\n[\s\S]*\n\n(?=[^\n])',
         '', text
     ).strip()
-    # If no trailing blank line, reasoning goes to end — strip it entirely
+    # If no trailing blank line, reasoning goes to end — strip entirely
     text = re.sub(r'💭\s*Reasoning:\s*\n[\s\S]*', '', text).strip()
-    cleaned = text
-    # also clean up leading empty lines
-    cleaned = re.sub(r'^\s+', '', cleaned)
-    if not cleaned:
-        return
-    text = cleaned
+    # Clean leading empty lines
+    text = re.sub(r'^\s+', '', text)
+    return text
 
-    # skip already-relayed messages
+
+# Watchdog state
+_last_event_time = time.monotonic()
+_watchdog_task = None
+
+
+async def watchdog_loop(client: TelegramClient):
+    """Detect zombie connections and force reconnect."""
+    global _last_event_time
+    while True:
+        await asyncio.sleep(60)
+        now = time.monotonic()
+        stale_seconds = now - _last_event_time
+        if stale_seconds > WATCHDOG_TIMEOUT:
+            log.warning(
+                "Watchdog: no events for %d seconds (threshold: %d). "
+                "Forcing reconnect.",
+                stale_seconds, WATCHDOG_TIMEOUT,
+            )
+            try:
+                await client.disconnect()
+                await client.connect()
+                _last_event_time = time.monotonic()
+                log.info("Watchdog: reconnect successful.")
+            except Exception as e:
+                log.error("Watchdog: reconnect failed: %s", e)
+                raise
+
+
+async def on_bot_message(event):
+    """Handle bot messages in groups with @mentions."""
+    global _last_event_time
+    _last_event_time = time.monotonic()
+
+    # Only group/supergroup chats
+    chat = event.chat
+    if not isinstance(chat, (Channel, Chat)):
+        return
+
+    # Only messages from bots
+    sender = event.sender
+    if not isinstance(sender, User) or not sender.bot:
+        return
+
+    text = event.text or event.message.caption or ""
+    if not text:
+        return
+
+    # Strip reasoning block
+    text = strip_reasoning(text)
+    if not text:
+        return
+
+    # Skip already-relayed messages
     if RELAY_FORMAT_RE.search(text):
         return
 
-    target_username, body = extract_target_and_body(text, message.entities)
+    # Extract target mention and body
+    entities = event.message.entities
+    target_username, body = extract_target_and_body(text, entities)
     if not target_username:
-        log.debug("No known bot mention found in: %.80s", text)
         return
     if not body:
         body = "(empty)"
 
-    sender_name = get_sender_name(message)
+    sender_name = get_sender_name(event)
     relay_text = (
         f"@{target_username}\n"
         f"to {target_username}\n"
@@ -204,43 +185,36 @@ async def on_bot_message(client: Client, message: Message):
     log.info("Relay: %s -> @%s | %.80s", sender_name, target_username, body)
 
     try:
-        await client.send_message(
-            chat_id=message.chat.id,
-            text=relay_text,
+        await event.client.send_message(
+            entity=event.chat_id,
+            message=relay_text,
         )
     except Exception as e:
         log.error("Failed to send relay message: %s", e)
 
 
-@app.on_disconnect()
-async def on_disconnect(client):
-    """
-    Called when Pyrogram's session detects a transport-level disconnect.
-    Pyrogram's session.py calls this from session.stop() when the recv_worker
-    exits (TCP close or transport error). After this callback, Pyrogram
-    automatically calls session.restart() which does stop() + start().
-
-    However, the auto-restart can fail silently (e.g., auth key issues,
-    persistent network problems). We log it for observability.
-    """
-    log.warning("Connection lost. Pyrogram will attempt auto-reconnect.")
-    _last_update_time = time.monotonic()
-
-
 async def main():
-    log.info("Hermes Userbot Relay starting...")
-    global _watchdog_task
+    log.info("Hermes Userbot Relay starting (Telethon)...")
 
-    await app.start()
-    me = await app.get_me()
+    client = TelegramClient(
+        str(RELAY_DIR / "hermes_relay_telemthon"),
+        API_ID,
+        API_HASH,
+    )
+
+    # Register event handlers before start
+    client.add_event_handler(on_bot_message, events.NewMessage(incoming=True))
+
+    await client.start()
+    me = await client.get_me()
     log.info("Logged in as %s (ID: %s)", me.first_name, me.id)
     log.info("Listening for bot messages in groups...")
     log.info("Watchdog timeout: %d seconds", WATCHDOG_TIMEOUT)
 
-    _last_update_time = time.monotonic()
-    _watchdog_task = asyncio.create_task(watchdog_loop())
+    _last_event_time = time.monotonic()
+    _watchdog_task = asyncio.create_task(watchdog_loop(client))
 
-    # Graceful shutdown on SIGTERM/SIGINT
+    # Graceful shutdown
     stop_event = asyncio.Event()
 
     def _signal_handler():
@@ -262,8 +236,8 @@ async def main():
             pass
 
     log.info("Shutting down...")
-    await app.stop()
+    await client.disconnect()
 
 
 if __name__ == "__main__":
-    app.run(main())
+    asyncio.run(main())

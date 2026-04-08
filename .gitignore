@@ -4,3 +4,6 @@ venv/
 .env
 *.session
 *.session-journal
+*.session
+*.session-journal
+*.session.bak
