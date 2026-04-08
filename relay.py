@@ -38,6 +38,10 @@ load_dotenv(RELAY_DIR / ".env")
 API_ID = int(os.environ.get("TELEGRAM_API_ID", "0"))
 API_HASH = os.environ.get("TELEGRAM_API_HASH", "")
 
+if API_ID <= 0 or not API_HASH.strip():
+    log.error("TELEGRAM_API_ID and TELEGRAM_API_HASH must be set in .env or environment.")
+    raise SystemExit(2)
+
 # Known bot usernames that should trigger relay
 KNOWN_BOT_USERNAMES = {
     "irispinion_bot",
@@ -123,7 +127,7 @@ async def watchdog_loop(client: TelegramClient):
         stale_seconds = now - _last_event_time
         if stale_seconds > WATCHDOG_TIMEOUT:
             log.warning(
-                "Watchdog: no events for %d seconds (threshold: %d). "
+                "Watchdog: no events for %.0f seconds (threshold: %d). "
                 "Forcing reconnect.",
                 stale_seconds, WATCHDOG_TIMEOUT,
             )
@@ -134,7 +138,7 @@ async def watchdog_loop(client: TelegramClient):
                 log.info("Watchdog: reconnect successful.")
             except Exception as e:
                 log.error("Watchdog: reconnect failed: %s", e)
-                raise
+                # Continue loop — retry on next check instead of dying
 
 
 async def on_bot_message(event):
@@ -194,10 +198,11 @@ async def on_bot_message(event):
 
 
 async def main():
+    global _last_event_time, _watchdog_task
     log.info("Hermes Userbot Relay starting (Telethon)...")
 
     client = TelegramClient(
-        str(RELAY_DIR / "hermes_relay_telemthon"),
+        str(RELAY_DIR / "hermes_relay_telethon"),
         API_ID,
         API_HASH,
     )
