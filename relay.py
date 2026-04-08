@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Hermes Userbot Relay
+Hermes Userbot Relay (Telethon)
 Telegram bot-to-bot message relay for group chats.
 
 Listens for bot messages that @mention other bots,
@@ -9,22 +9,38 @@ so the target bot can actually receive it.
 
 Relay format:
     @irispinion_bot
-    to hermes
+    to irispinion_bot
+    from hermes
     <original body>
+
+    @​hermesspinion_bot 로 멘션하여 답장할 수 있습니다.
+
+Stability features:
+    - Watchdog: detects stale event loops and reconnects
+    - Graceful shutdown on SIGTERM/SIGINT
 """
 
+import asyncio
 import os
 import re
+import signal
 import logging
+import time
 from pathlib import Path
 from dotenv import load_dotenv
-from pyrogram import Client, filters
-from pyrogram.types import Message
-from pyrogram import idle
+from telethon import TelegramClient, events
+from telethon.tl.types import Channel, Chat, User
 
 RELAY_DIR = Path(__file__).parent
 
 load_dotenv(RELAY_DIR / ".env")
+
+API_ID = int(os.environ.get("TELEGRAM_API_ID", "0"))
+API_HASH = os.environ.get("TELEGRAM_API_HASH", "")
+
+if API_ID <= 0 or not API_HASH.strip():
+    log.error("TELEGRAM_API_ID and TELEGRAM_API_HASH must be set in .env or environment.")
+    raise SystemExit(2)
 
 # Known bot usernames that should trigger relay
 KNOWN_BOT_USERNAMES = {
@@ -35,18 +51,24 @@ KNOWN_BOT_USERNAMES = {
 MENTION_RE = re.compile(r'@(\w+)')
 RELAY_FORMAT_RE = re.compile(r'^@\w+\nto \w+', re.MULTILINE)
 
+# Watchdog: if no events arrive in this many seconds, reconnect
+WATCHDOG_TIMEOUT = 300  # 5 minutes
+
 logging.basicConfig(
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    level=logging.INFO,
 )
 log = logging.getLogger("relay")
 
 
-def get_sender_name(message: Message) -> str:
+def get_sender_name(event) -> str:
     """Get the sender's telegram username or first name."""
-    if not message.from_user:
+    sender = event.sender
+    if not sender:
         return "unknown"
-    return message.from_user.username or message.from_user.first_name or "unknown"
+    if isinstance(sender, User):
+        return sender.username or sender.first_name or "unknown"
+    return getattr(sender, 'title', 'unknown')
 
 
 def extract_target_and_body(text: str, entities=None):
@@ -58,92 +80,178 @@ def extract_target_and_body(text: str, entities=None):
             body = MENTION_RE.sub('', text).strip()
             return mention, body
 
-    # Fallback: check entities for mention type (MessageEntityType.MENTION)
-    # Pyrogram MessageEntity has no .text attribute; extract from text using offset/length
+    # Fallback: check entities for MessageEntityMention
     if entities:
         for entity in entities:
-            entity_type = getattr(entity, 'type', None)
-            if entity_type is None:
-                continue
-            type_name = entity_type.value if hasattr(entity_type, 'value') else str(entity_type)
-            if type_name in ('mention', 'text_mention'):
+            if hasattr(entity, 'offset') and hasattr(entity, 'length'):
                 try:
                     entity_text = text[entity.offset:entity.offset + entity.length]
-                except (AttributeError, IndexError):
+                except (IndexError, TypeError):
                     continue
                 if entity_text.startswith('@'):
                     username = entity_text[1:]
-                else:
-                    username = entity_text
-                if username in KNOWN_BOT_USERNAMES:
-                    body = text.strip()
-                    return username, body
+                    if username in KNOWN_BOT_USERNAMES:
+                        body = text.strip()
+                        return username, body
 
     return None, None
 
 
-app = Client(
-    str(RELAY_DIR / "hermes_relay"),
-    api_id=int(os.environ.get("TELEGRAM_API_ID", "0")),
-    api_hash=os.environ.get("TELEGRAM_API_HASH", ""),
-)
+def strip_reasoning(text: str) -> str:
+    """Remove 💭 Reasoning: blocks from text.
+
+    Handles:
+    - 💭 **Reasoning:** (bold markdown)
+    - Code block wrapping: ```...content...```
+    - Plain format: 💭 Reasoning:\n...content...
+    """
+    # Header: 💭 with optional **bold**, "Reasoning:", optional **bold**, newline
+    header = r'💭\s*\*{0,2}Reasoning:\*{0,2}\s*\n'
+
+    # 1. Code block wrapped: header + ``` ... ```
+    text = re.sub(header + r'\s*```\s*\n?[\s\S]*?```\s*', '', text)
+
+    # 2. Plain block — greedy to last \n\n before actual content
+    text = re.sub(header + r'[\s\S]*\n\n(?=[^\n])', '', text)
+
+    # 3. Reasoning-only message (nothing after the block)
+    text = re.sub(header + r'[\s\S]*', '', text)
+
+    # Clean leading whitespace
+    text = re.sub(r'^\s+', '', text)
+    return text
 
 
-@app.on_message(filters.group & filters.bot)
-async def on_bot_message(client: Client, message: Message):
-    text = message.text or message.caption or ""
-    sender = get_sender_name(message)
-    log.debug("Bot message from %s | text: %.200s | entities: %s", sender, text, [(e.type, getattr(e, 'text', '')) for e in (message.entities or [])])
+# Watchdog state
+_last_event_time = time.monotonic()
+_watchdog_task = None
+
+
+async def watchdog_loop(client: TelegramClient):
+    """Detect zombie connections and force reconnect."""
+    global _last_event_time
+    while True:
+        await asyncio.sleep(60)
+        now = time.monotonic()
+        stale_seconds = now - _last_event_time
+        if stale_seconds > WATCHDOG_TIMEOUT:
+            log.warning(
+                "Watchdog: no events for %.0f seconds (threshold: %d). "
+                "Forcing reconnect.",
+                stale_seconds, WATCHDOG_TIMEOUT,
+            )
+            try:
+                await client.disconnect()
+                await client.connect()
+                _last_event_time = time.monotonic()
+                log.info("Watchdog: reconnect successful.")
+            except Exception as e:
+                log.error("Watchdog: reconnect failed: %s", e)
+                # Continue loop — retry on next check instead of dying
+
+
+async def on_bot_message(event):
+    """Handle bot messages in groups with @mentions."""
+    global _last_event_time
+    _last_event_time = time.monotonic()
+
+    # Only group/supergroup chats
+    chat = event.chat
+    if not isinstance(chat, (Channel, Chat)):
+        return
+
+    # Only messages from bots
+    sender = event.sender
+    if not isinstance(sender, User) or not sender.bot:
+        return
+
+    text = event.text or event.message.caption or ""
     if not text:
         return
 
-    # skip reasoning-only messages (no content after stripping reasoning)
-    # Reasoning block: starts with 💭 Reasoning:, consume GREEDILY until
-    # the LAST blank line (or end of text), so internal \n\n in reasoning
-    # doesn't cause premature cutoff.
-    text = re.sub(
-        r'💭\s*Reasoning:\s*\n[\s\S]*\n\s*\n(?=[^\n])',
-        '', text
-    ).strip()
-    # If no trailing blank line, reasoning goes to end — strip it entirely
-    text = re.sub(r'💭\s*Reasoning:\s*\n[\s\S]*', '', text).strip()
-    cleaned = text
-    # also clean up leading empty lines
-    cleaned = re.sub(r'^\s+', '', cleaned)
-    if not cleaned:
+    # Strip reasoning block
+    text = strip_reasoning(text)
+    if not text:
         return
-    text = cleaned
 
-    # skip already-relayed messages
+    # Skip already-relayed messages
     if RELAY_FORMAT_RE.search(text):
         return
 
-    target_username, body = extract_target_and_body(text, message.entities)
+    # Extract target mention and body
+    entities = event.message.entities
+    target_username, body = extract_target_and_body(text, entities)
     if not target_username:
-        log.debug("No known bot mention found in: %.80s", text)
         return
     if not body:
         body = "(empty)"
 
-    sender_name = get_sender_name(message)
-    relay_text = f"@{target_username}\nto {target_username}\nfrom {sender_name}\n{body}\n\n@\u200b{sender_name} 로 멘션하여 답장할 수 있습니다."
+    sender_name = get_sender_name(event)
+    relay_text = (
+        f"@{target_username}\n"
+        f"to {target_username}\n"
+        f"from {sender_name}\n"
+        f"{body}\n\n"
+        f"@\u200b{sender_name} 로 멘션하여 답장할 수 있습니다."
+    )
 
     log.info("Relay: %s -> @%s | %.80s", sender_name, target_username, body)
 
-    await client.send_message(
-        chat_id=message.chat.id,
-        text=relay_text,
-    )
+    try:
+        await event.client.send_message(
+            entity=event.chat_id,
+            message=relay_text,
+        )
+    except Exception as e:
+        log.error("Failed to send relay message: %s", e)
 
 
 async def main():
-    log.info("Hermes Userbot Relay starting...")
-    await app.start()
-    me = await app.get_me()
+    global _last_event_time, _watchdog_task
+    log.info("Hermes Userbot Relay starting (Telethon)...")
+
+    client = TelegramClient(
+        str(RELAY_DIR / "hermes_relay_telethon"),
+        API_ID,
+        API_HASH,
+    )
+
+    # Register event handlers before start
+    client.add_event_handler(on_bot_message, events.NewMessage(incoming=True))
+
+    await client.start()
+    me = await client.get_me()
     log.info("Logged in as %s (ID: %s)", me.first_name, me.id)
     log.info("Listening for bot messages in groups...")
-    await idle()
+    log.info("Watchdog timeout: %d seconds", WATCHDOG_TIMEOUT)
+
+    _last_event_time = time.monotonic()
+    _watchdog_task = asyncio.create_task(watchdog_loop(client))
+
+    # Graceful shutdown
+    stop_event = asyncio.Event()
+
+    def _signal_handler():
+        log.info("Received shutdown signal.")
+        stop_event.set()
+
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, _signal_handler)
+
+    await stop_event.wait()
+
+    # Cleanup
+    if _watchdog_task:
+        _watchdog_task.cancel()
+        try:
+            await _watchdog_task
+        except asyncio.CancelledError:
+            pass
+
+    log.info("Shutting down...")
+    await client.disconnect()
 
 
 if __name__ == "__main__":
-    app.run(main())
+    asyncio.run(main())
