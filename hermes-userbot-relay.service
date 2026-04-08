@@ -8,7 +8,7 @@ Type=simple
 WorkingDirectory=%h/hermes-userbot-relay
 ExecStart=%h/hermes-userbot-relay/venv/bin/python relay.py
 Restart=on-failure
-RestartSec=5
+RestartSec=10
 EnvironmentFile=%h/hermes-userbot-relay/.env
 
 [Install]
