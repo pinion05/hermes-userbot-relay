@@ -98,17 +98,26 @@ def extract_target_and_body(text: str, entities=None):
 
 
 def strip_reasoning(text: str) -> str:
-    """Remove 💭 Reasoning: blocks from text, handling internal blank lines."""
-    # Normalize multiple blank lines to single blank line
-    text = re.sub(r'\n[ \t]*\n', '\n\n', text)
-    # Greedy: match reasoning block up to the last blank line before content
-    text = re.sub(
-        r'💭\s*Reasoning:\s*\n[\s\S]*\n\n(?=[^\n])',
-        '', text
-    ).strip()
-    # If no trailing blank line, reasoning goes to end — strip entirely
-    text = re.sub(r'💭\s*Reasoning:\s*\n[\s\S]*', '', text).strip()
-    # Clean leading empty lines
+    """Remove 💭 Reasoning: blocks from text.
+
+    Handles:
+    - 💭 **Reasoning:** (bold markdown)
+    - Code block wrapping: ```...content...```
+    - Plain format: 💭 Reasoning:\n...content...
+    """
+    # Header: 💭 with optional **bold**, "Reasoning:", optional **bold**, newline
+    header = r'💭\s*\*{0,2}Reasoning:\*{0,2}\s*\n'
+
+    # 1. Code block wrapped: header + ``` ... ```
+    text = re.sub(header + r'\s*```\s*\n?[\s\S]*?```\s*', '', text)
+
+    # 2. Plain block — greedy to last \n\n before actual content
+    text = re.sub(header + r'[\s\S]*\n\n(?=[^\n])', '', text)
+
+    # 3. Reasoning-only message (nothing after the block)
+    text = re.sub(header + r'[\s\S]*', '', text)
+
+    # Clean leading whitespace
     text = re.sub(r'^\s+', '', text)
     return text
 
